@@ -1,0 +1,122 @@
+[
+  {
+    "page": "Python docs (stdlib)",
+    "url": "https://docs.python.org/3/library/json.html",
+    "status": "success",
+    "confidence": 100,
+    "tokens_used": 376,
+    "raw_tokens": 28179,
+    "savings_pct": 98.66567301891479,
+    "time_sec": 0.0,
+    "nodes": 73,
+    "edges": 125
+  },
+  {
+    "page": "Python asyncio docs",
+    "url": "https://docs.python.org/3/library/asyncio-task.html",
+    "status": "success",
+    "confidence": 100,
+    "tokens_used": 552,
+    "raw_tokens": 43837,
+    "savings_pct": 98.74078974382371,
+    "time_sec": 0.77,
+    "nodes": 113,
+    "edges": 205
+  },
+  {
+    "page": "MDN JavaScript",
+    "url": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise",
+    "status": "success",
+    "confidence": 100,
+    "tokens_used": 210,
+    "raw_tokens": 49007,
+    "savings_pct": 99.57148978717326,
+    "time_sec": 0.22,
+    "nodes": 82,
+    "edges": 119
+  },
+  {
+    "page": "React docs",
+    "url": "https://react.dev/reference/react/useState",
+    "status": "success",
+    "confidence": 100,
+    "tokens_used": 253,
+    "raw_tokens": 110957,
+    "savings_pct": 99.77198374144939,
+    "time_sec": 0.3,
+    "nodes": 120,
+    "edges": 177
+  },
+  {
+    "page": "GitHub REST API",
+    "url": "https://docs.github.com/en/rest/repos/repos",
+    "status": "success",
+    "confidence": 85,
+    "tokens_used": 372,
+    "raw_tokens": 343415,
+    "savings_pct": 99.89167625176536,
+    "time_sec": 3.17,
+    "nodes": 596,
+    "edges": 785
+  },
+  {
+    "page": "OpenAI API docs",
+    "url": "https://platform.openai.com/docs/api-reference/chat/create",
+    "status": "fallback_needed",
+    "confidence": 0,
+    "tokens_used": 0,
+    "raw_tokens": 1635,
+    "savings_pct": 100.0,
+    "time_sec": 4.9,
+    "nodes": 0,
+    "edges": 0
+  },
+  {
+    "page": "Rust Tokio docs",
+    "url": "https://docs.rs/tokio/latest/tokio/index.html",
+    "status": "success",
+    "confidence": 100,
+    "tokens_used": 225,
+    "raw_tokens": 14130,
+    "savings_pct": 98.40764331210191,
+    "time_sec": 0.39,
+    "nodes": 75,
+    "edges": 106
+  },
+  {
+    "page": "Next.js docs",
+    "url": "https://nextjs.org/docs/app/building-your-application/routing",
+    "status": "success",
+    "confidence": 100,
+    "tokens_used": 262,
+    "raw_tokens": 249694,
+    "savings_pct": 99.89507156759873,
+    "time_sec": 0.49,
+    "nodes": 43,
+    "edges": 54
+  },
+  {
+    "page": "Tailwind CSS",
+    "url": "https://tailwindcss.com/docs/flex",
+    "status": "success",
+    "confidence": 100,
+    "tokens_used": 231,
+    "raw_tokens": 97367,
+    "savings_pct": 99.76275329423727,
+    "time_sec": 0.23,
+    "nodes": 89,
+    "edges": 112
+  },
+  {
+    "page": "Kubernetes docs",
+    "url": "https://kubernetes.io/docs/concepts/workloads/pods/",
+    "status": "success",
+    "confidence": 100,
+    "tokens_used": 334,
+    "raw_tokens": 131932,
+    "savings_pct": 99.74683928084164,
+    "time_sec": 0.64,
+    "nodes": 70,
+    "edges": 83
+  }
+]
