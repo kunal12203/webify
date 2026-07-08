@@ -6,3 +6,5 @@ dist/
 *.egg-info/
 .env
 .venv/
+benchmark_*
+benchmark_real_results/

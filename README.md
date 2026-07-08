@@ -1,17 +1,71 @@
 # Webify
 
-Semantic web graph for AI coding agents. Builds a graph from any web page, then retrieves only the relevant nodes via BFS traversal.
+Adaptive web research for AI coding agents. Search the web, build semantic graphs, get synthesized answers — at 5% the cost of deep research tools.
 
-**74% cheaper** and **16x faster** than reading full pages.
+## What it does
+
+| Tool | Purpose | Cost |
+|------|---------|------|
+| `web_find(query)` | Multi-source web search + synthesis | ~$0.003/query |
+| `web_lookup(url, query)` | Single-page graph retrieval | ~$0.0005/query |
+
+**web_find** searches DuckDuckGo, builds semantic graphs from multiple sources in parallel, extracts relevant content via BM25, and synthesizes with Haiku. It adapts depth based on query complexity — simple factual queries hit 3 sources, multi-dimensional research queries scale to 6+ sources with multi-aspect retrieval.
+
+**web_lookup** fetches a single page, builds a heading-hierarchy graph, and returns only the relevant nodes (~250-750 tokens instead of 5,000-50,000).
+
+## Benchmarks
+
+Blind A/B evaluation against Claude's Deep Research on 15 unseen queries (5 tech, 5 non-tech, 5 mixed). Judge: Sonnet, scoring accuracy + completeness + specificity (1-5 each, max 15/query).
+
+| Metric | Webify | Deep Research |
+|--------|--------|--------------|
+| Quality score | **68/75** (90.7%) | 73/75 (97.3%) |
+| Cost per query | **~$0.003** | ~$0.05+ |
+| Latency | **30-90s** | 80-280s |
+| Cost efficiency | **18× better** | baseline |
+
+Webify achieves 91% of Deep Research quality at 5% of the cost. The gap is always on completeness/specificity, never accuracy — Webify finds correct information but Deep Research finds more of it.
+
+<details>
+<summary>Per-query breakdown (unseen validation set)</summary>
+
+| Query | Webify | Deep Research | Winner |
+|-------|--------|--------------|--------|
+| Battery degradation mechanisms | 13/15 | 15/15 | Deep |
+| OAuth vs OIDC | 13/15 | 15/15 | Deep |
+| Coral reef bleaching | 14/15 | 15/15 | Deep |
+| CRISPR gene editing | 15/15 | 13/15 | **Webify** |
+| Earthquake tsunami mechanics | 13/15 | 15/15 | Deep |
+
+Scoring: (accuracy/completeness/specificity), each 1-5. Blind judge with randomized A/B order.
+</details>
 
 ## How it works
 
+### web_find pipeline
+
 ```
-URL → Fetch → Extract content → Build heading-hierarchy graph → Cache
-Query → Score nodes (BM25) → BFS traversal → Return ~250-750 tokens
+Query → Complexity Detection (1-3) → DuckDuckGo Search
+  → Parallel Graph Builds (3-6+ sources)
+  → Multi-Aspect BM25 Extraction
+  → Haiku Synthesis + Raw Fragments
 ```
 
-Instead of feeding 5,000-50,000 tokens of a full web page to your AI, Webify returns only the 3-5 most relevant sections (~250-750 tokens).
+Key components:
+- **Adaptive complexity**: Heuristic scoring scales sources, nodes, and synthesis depth
+- **LinUCB contextual bandit**: Learns query reformulation strategies per query type
+- **Multi-aspect retrieval**: Decomposes complex queries into sub-aspects, runs BM25 independently
+- **Domain affinity**: Welford online stats — learns which sites produce quality content
+- **Citation chasing**: Follows primary-source URLs found in pages
+- **No hard caps**: The calling model controls depth by making multiple calls
+
+### web_lookup pipeline
+
+```
+URL → Fetch → Extract (Readability/NEXT_DATA/JSON-LD)
+  → Build heading-hierarchy graph → Cache (24h)
+Query → BM25 score nodes → BFS traversal → ~250-750 tokens
+```
 
 ## Installation
 
@@ -35,113 +89,28 @@ The installer will:
 
 **Requirements:** Python 3.9+, pip, git
 
----
-
 ### Manual Installation
 
-If you prefer manual setup or the auto-installer doesn't detect your tool:
-
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/kunal12203/webify.git
-   cd webify
-   ```
-
-2. **Install the MCP package:**
-   ```bash
-   pip install "mcp>=1.3.0"
-   ```
-
-3. **Configure your MCP client** (see [Tool-Specific Setup](#tool-specific-setup) below)
-
-## Usage
-
-### As a Claude Code MCP tool
-
 ```bash
-# Already configured if you used the installer
-# Otherwise, manually add:
-claude mcp add webify -- python3 /path/to/webify/mcp_server.py
+git clone https://github.com/kunal12203/webify.git
+cd webify
+pip install "mcp>=1.3.0"
 ```
 
-Then use in any Claude Code session:
-```
-> Look up the rate limits for the GitHub API
-# Claude automatically uses web_lookup("https://docs.github.com/en/rest/rate-limit", "rate limits")
-```
+Then configure your MCP client (see [Tool-Specific Setup](#tool-specific-setup) below).
 
-### As a CLI
+## Updating
 
+**Auto-install users:**
 ```bash
-# Build a graph
-python webify.py build https://docs.python.org/3/library/json.html
-
-# Look up specific info
-python webify.py lookup https://docs.python.org/3/library/json.html "how to parse JSON string"
-
-# Check stats
-python webify.py stats https://docs.python.org/3/library/json.html
+curl -fsSL https://graperoot.dev/webify/install.sh | bash
 ```
 
-### As a Python library
-
-```python
-import webify
-
-# Smart lookup with confidence scoring
-result = webify.smart_lookup("https://docs.python.org/3/library/json.html", "parse JSON")
-print(result["status"])      # "success"
-print(result["content"])     # relevant sections only
-print(result["tokens_used"]) # ~376 vs ~12000 for full page
-
-# Build graph separately
-graph = webify.build_graph("https://example.com/docs")
-
-# Direct retrieval
-nodes = webify.retrieve("https://example.com/docs", "authentication")
+**Manual install users:**
+```bash
+cd /path/to/webify
+git pull origin master
 ```
-
-## Features
-
-- **Zero dependencies** — stdlib only (just needs `mcp` for the MCP server)
-- **Multi-strategy extraction** — Readability scoring, `__NEXT_DATA__`, JSON-LD, Nuxt
-- **Automatic fallback** — Wayback Machine, Google Cache, raw source URLs
-- **Confidence scoring** — tells you when to fall back to full page fetch
-- **24h caching** — one fetch per page per day
-- **BFS graph traversal** — follows edges to find connected context
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│  1. FETCH                                           │
-│     Primary → Cache proxies (Wayback/Google/Raw)    │
-├─────────────────────────────────────────────────────┤
-│  2. EXTRACT                                         │
-│     Readability scoring → __NEXT_DATA__ → JSON-LD   │
-├─────────────────────────────────────────────────────┤
-│  3. CHUNK                                           │
-│     Heading-hierarchy sections (Algolia approach)   │
-├─────────────────────────────────────────────────────┤
-│  4. GRAPH                                           │
-│     Nodes (heading/code/param/table/list/text)      │
-│     Edges (contains/has_example/see_also/sibling)   │
-├─────────────────────────────────────────────────────┤
-│  5. RETRIEVE                                        │
-│     BM25 scoring → BFS from top seeds → cluster     │
-├─────────────────────────────────────────────────────┤
-│  6. CONFIDENCE                                      │
-│     Score extraction quality → fallback signal      │
-└─────────────────────────────────────────────────────┘
-```
-
-## MCP Tools
-
-| Tool | Description |
-|------|-------------|
-| `web_lookup(url, query)` | Smart lookup — returns relevant content or fallback signal |
-| `web_build(url)` | Pre-build graph for a URL (useful for multi-query pages) |
-| `web_stats(url)` | Show graph stats for a cached URL |
 
 ## Tool-Specific Setup
 
@@ -151,7 +120,7 @@ nodes = webify.retrieve("https://example.com/docs", "authentication")
 claude mcp add webify -- python3 ~/.webify/mcp_server.py
 ```
 
-Verify installation:
+Verify:
 ```bash
 claude mcp list  # Should show "webify"
 ```
@@ -164,23 +133,21 @@ Add to `~/.continue/config.json`:
   "mcpServers": {
     "webify": {
       "command": "python3",
-      "args": ["/Users/YOUR_USERNAME/.webify/mcp_server.py"]
+      "args": ["~/.webify/mcp_server.py"]
     }
   }
 }
 ```
 
-**Note:** Replace `/Users/YOUR_USERNAME/` with your actual home directory path.
-
 ### Cursor
 
-Add to `~/.cursor/mcp.json` (create if it doesn't exist):
+Add to `~/.cursor/mcp.json`:
 ```json
 {
   "mcpServers": {
     "webify": {
       "command": "python3",
-      "args": ["/Users/YOUR_USERNAME/.webify/mcp_server.py"],
+      "args": ["~/.webify/mcp_server.py"],
       "env": {}
     }
   }
@@ -195,7 +162,7 @@ Add to `~/.windsurf/settings.json`:
   "mcp.servers": {
     "webify": {
       "command": "python3",
-      "args": ["/Users/YOUR_USERNAME/.webify/mcp_server.py"]
+      "args": ["~/.webify/mcp_server.py"]
     }
   }
 }
@@ -209,7 +176,7 @@ Add to `~/.config/zed/settings.json`:
   "mcp_servers": {
     "webify": {
       "command": "python3",
-      "args": ["/Users/YOUR_USERNAME/.webify/mcp_server.py"]
+      "args": ["~/.webify/mcp_server.py"]
     }
   }
 }
@@ -217,67 +184,77 @@ Add to `~/.config/zed/settings.json`:
 
 ### Other MCP Clients
 
-Webify uses the stdio transport. Configure your MCP client with:
+Webify uses stdio transport. Configure with:
 - **Command:** `python3`
 - **Args:** `["/path/to/webify/mcp_server.py"]`
 - **Transport:** stdio
 
+## MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `web_find(query)` | Search the web + synthesize multi-source answer |
+| `web_lookup(url, query)` | Retrieve relevant content from a specific URL |
+| `web_build(url)` | Pre-build graph for a URL (cache it) |
+| `web_stats(url)` | Show graph stats for a cached URL |
+
+## Usage
+
+### As a Claude Code MCP tool
+
+```
+> What are the tradeoffs between Raft and Paxos consensus algorithms?
+# Claude uses web_find → searches, builds graphs, synthesizes answer
+
+> Look up rate limits in the GitHub REST API docs
+# Claude uses web_lookup → fetches specific page, returns relevant sections
+```
+
+### As a CLI
+
+```bash
+python webify.py build https://docs.python.org/3/library/json.html
+python webify.py lookup https://docs.python.org/3/library/json.html "parse JSON string"
+python webify.py stats https://docs.python.org/3/library/json.html
+```
+
+### As a Python library
+
+```python
+import webify
+
+# Multi-source web search
+result = webify.web_find("how does mTLS work in service meshes")
+print(result["content"])     # Synthesized answer
+print(result["sources"])     # [{url, title, confidence, tokens}]
+
+# Single-page lookup
+result = webify.smart_lookup("https://docs.python.org/3/library/json.html", "parse JSON")
+print(result["content"])     # Relevant sections only (~376 tokens)
+```
+
 ## Configuration
 
-### Environment Variables
+| Env var | Required | Description |
+|---------|----------|-------------|
+| `ANTHROPIC_API_KEY` | For `web_find` | Haiku synthesis + bandit learning |
+| `WEBIFY_CACHE_DIR` | No | Cache location (default: `~/.cache/webify`) |
 
-| Env var | Default | Description |
-|---------|---------|-------------|
-| `WEBIFY_CACHE_DIR` | `~/.cache/webify` | Where to store cached graphs |
+## Troubleshooting
 
-### Troubleshooting
-
-**Check Python version:**
 ```bash
-python3 --version  # Must be >= 3.9
+python3 --version              # Must be >= 3.9
+python3 -c "import mcp"       # Check MCP package
+ls ~/.cache/webify/            # Check cache
+python3 ~/.webify/mcp_server.py  # Test server (Ctrl+C to exit)
 ```
 
-**Test MCP server directly:**
-```bash
-python3 ~/.webify/mcp_server.py
-# Should wait for stdin (MCP protocol active)
-# Press Ctrl+C to exit
-```
-
-**Check cache:**
-```bash
-ls ~/.cache/webify/  # Should show cached .json files after first use
-```
-
-**Verify MCP package:**
-```bash
-python3 -c "import mcp; print(mcp.__version__)"  # Should print version >= 1.3.0
-```
-
-**Common issues:**
-- **"mcp module not found"** → Run `pip install "mcp>=1.3.0"`
-- **"Permission denied"** → Make sure `mcp_server.py` is readable: `chmod +r ~/.webify/mcp_server.py`
-- **Tool doesn't see Webify** → Restart your editor after configuration changes
-
-## Performance
-
-Tested on 50 documentation pages:
-- **86% reliability** (returns useful content)
-- **74% token savings** vs full page reads
-- **16x faster** after initial build (cache hit)
-- Average response: ~376 tokens (vs ~12,000 for full page)
-
-## Contributing
-
-PRs welcome. The engine is a single file (`webify.py`) with zero external dependencies.
-
-Key areas for contribution:
-- More extraction strategies (MDX, Docusaurus, Sphinx)
-- Better BM25 scoring
-- Edge type improvements
-- Cache invalidation strategies
-- Test coverage
+Common issues:
+- **"mcp module not found"** → `pip install "mcp>=1.3.0"`
+- **"Permission denied"** → `chmod +r ~/.webify/mcp_server.py`
+- **Tool not detected** → Restart your editor after config changes
+- **web_find returns errors** → Set `ANTHROPIC_API_KEY` environment variable
 
 ## License
 
-MIT
+[MIT](LICENSE) — Copyright (c) 2026 GrapeRoot

@@ -22,6 +22,7 @@ import math
 import os
 import re
 import time
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -57,7 +58,8 @@ def _content_hash(text: str) -> str:
 
 
 def _estimate_tokens(text: str) -> int:
-    return len(text) // 4
+    code_chars = sum(len(m) for m in re.findall(r'```.*?```|`[^`]+`', text, re.DOTALL))
+    return round((len(text) - code_chars) / 3.7 + code_chars / 2.5)
 
 
 def _decode_entities(text: str) -> str:
@@ -784,6 +786,22 @@ def _assess_confidence(nodes: list[dict], html: str) -> dict:
         score -= 30
         reasons.append(f"boilerplate detected ({boilerplate_hits} signals)")
 
+    # Nav-shell inflation: many nodes but nearly all are short headings/nav
+    # This is the false-confidence pattern on JS-heavy docs sites
+    nav_count = sum(1 for n in nodes if _is_nav_node(n))
+    nav_ratio = nav_count / max(num_nodes, 1)
+    if nav_ratio > 0.6:
+        score -= 25
+        reasons.append(f"nav-shell inflation ({nav_ratio:.0%} nav nodes)")
+    elif nav_ratio > 0.4:
+        score -= 10
+        reasons.append(f"high nav ratio ({nav_ratio:.0%})")
+
+    # High node count but very thin content = JS app shell, not real extraction
+    if num_nodes >= 20 and avg_content_len < 60:
+        score -= 20
+        reasons.append(f"thin content at scale ({num_nodes} nodes, avg {avg_content_len:.0f} chars)")
+
     if '<div id="root"></div>' in html or '<div id="app"></div>' in html:
         text_in_body = len(re.sub(r'<[^>]+>', '', html))
         script_len = sum(len(m) for m in re.findall(r'<script[^>]*>.*?</script>', html, re.DOTALL))
@@ -991,6 +1009,8 @@ def build_graph(url: str, force_refresh: bool = False) -> dict:
     for e in edges:
         edge_type_counts[e['type']] = edge_type_counts.get(e['type'], 0) + 1
 
+    citation_urls = _extract_citation_urls(html, url)
+
     graph = {
         "url": url,
         "url_hash": url_hash,
@@ -998,6 +1018,7 @@ def build_graph(url: str, force_refresh: bool = False) -> dict:
         "fetched_at": time.time(),
         "extraction_method": extraction_method,
         "confidence": confidence,
+        "citation_urls": citation_urls,
         "nodes": nodes,
         "edges": edges,
         "stats": {
@@ -1032,7 +1053,450 @@ def _extract_meta(html: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GRAPH RETRIEVAL (BFS from best match + edge traversal)
+# CONTEXTUAL BANDIT — learns which search strategies work for which queries
+#
+# Problem: given query q, choose search strategy s* from S that maximises
+# retrieved content quality. No domain labels. Learns from observed reward.
+#
+# Algorithm: LinUCB (Li et al., 2010)
+#   - Context x ∈ R^d : char-trigram hash → random projection (d=16, stdlib only)
+#   - Arms: 6 domain-agnostic query reformulation templates
+#   - Per-arm state: (A ∈ R^{d×d}, b ∈ R^d), A_0 = I, b_0 = 0
+#   - Selection: a* = argmax_a [θ̂_a^T x + α √(x^T A_a^{-1} x)]
+#   - Update (rank-1 Sherman-Morrison): A ← A + xx^T, b ← b + rx
+#   - Domain affinity: Welford online mean/var per domain → re-rank DDG results
+#   - Persistence: ~/.cache/webify/ml_state.json
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_ML_STATE_PATH = CACHE_DIR / "ml_state.json"
+_BANDIT_DIM = 16          # context vector dimension
+_BANDIT_ALPHA = 1.0       # UCB exploration coefficient
+_BANDIT_ARMS = [
+    "{q}",                                        # baseline
+    "{q} evidence research study",                # evidence-seeking
+    "{q} mechanism explained how it works",       # mechanistic
+    "{q} review analysis findings data",          # analytical
+    "{q} history background context causes",      # contextual/historical
+    "{q} guide tutorial examples",                # practical
+]
+
+# ── Deterministic random projection (fixed seed, no numpy) ────────────────────
+
+def _lcg(seed: int, n: int) -> list[float]:
+    """Linear congruential generator — deterministic, stdlib-only Gaussian approx."""
+    vals = []
+    s = seed & 0xFFFFFFFF
+    for _ in range(n):
+        s = (1664525 * s + 1013904223) & 0xFFFFFFFF
+        # Box-Muller via two uniform samples
+        u1 = s / 0xFFFFFFFF
+        s = (1664525 * s + 1013904223) & 0xFFFFFFFF
+        u2 = s / 0xFFFFFFFF
+        u1 = max(u1, 1e-10)
+        import math as _math
+        z = _math.sqrt(-2 * _math.log(u1)) * _math.cos(2 * _math.pi * u2)
+        vals.append(z / _math.sqrt(n))   # scale for unit norm projection
+    return vals
+
+def _build_projection_matrix(vocab_size: int, dim: int) -> list[list[float]]:
+    """Fixed projection matrix R ∈ R^{vocab_size × dim}."""
+    return [_lcg(i * 1000003 + 7, dim) for i in range(vocab_size)]
+
+_TRIGRAM_VOCAB = 1000   # hash space
+_PROJ_MATRIX: list[list[float]] | None = None
+
+def _get_projection() -> list[list[float]]:
+    global _PROJ_MATRIX
+    if _PROJ_MATRIX is None:
+        _PROJ_MATRIX = _build_projection_matrix(_TRIGRAM_VOCAB, _BANDIT_DIM)
+    return _PROJ_MATRIX
+
+def _query_to_context(query: str) -> list[float]:
+    """
+    query → unit-norm vector in R^{_BANDIT_DIM}.
+    Method: char-trigram TF (hash to _TRIGRAM_VOCAB) → random projection → L2-norm.
+    """
+    q = query.lower()
+    counts: dict[int, int] = {}
+    for i in range(len(q) - 2):
+        tri = q[i:i+3]
+        h = (hash(tri) & 0x7FFFFFFF) % _TRIGRAM_VOCAB
+        counts[h] = counts.get(h, 0) + 1
+
+    total = max(sum(counts.values()), 1)
+    proj = _get_projection()
+    vec = [0.0] * _BANDIT_DIM
+    for h, c in counts.items():
+        tf = c / total
+        for j in range(_BANDIT_DIM):
+            vec[j] += tf * proj[h][j]
+
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / norm for v in vec]
+
+
+# ── Matrix helpers (no numpy) ─────────────────────────────────────────────────
+
+def _mat_identity(d: int) -> list[list[float]]:
+    return [[1.0 if i == j else 0.0 for j in range(d)] for i in range(d)]
+
+def _mat_vec(M: list[list[float]], v: list[float]) -> list[float]:
+    return [sum(M[i][j] * v[j] for j in range(len(v))) for i in range(len(M))]
+
+def _dot(a: list[float], b: list[float]) -> float:
+    return sum(x * y for x, y in zip(a, b))
+
+def _sherman_morrison_update(A_inv: list[list[float]], x: list[float]) -> list[list[float]]:
+    """Rank-1 update: (A + xx^T)^{-1} = A^{-1} - (A^{-1}x)(A^{-1}x)^T / (1 + x^T A^{-1} x)"""
+    Ax = _mat_vec(A_inv, x)
+    denom = 1.0 + _dot(x, Ax)
+    d = len(x)
+    return [
+        [A_inv[i][j] - Ax[i] * Ax[j] / denom for j in range(d)]
+        for i in range(d)
+    ]
+
+
+# ── Persistent state ──────────────────────────────────────────────────────────
+
+def _load_ml_state() -> dict:
+    try:
+        if _ML_STATE_PATH.exists():
+            raw = json.loads(_ML_STATE_PATH.read_text())
+            # Validate shape
+            if (isinstance(raw.get("arms"), list) and
+                    len(raw["arms"]) == len(_BANDIT_ARMS) and
+                    len(raw["arms"][0].get("A_inv", [])) == _BANDIT_DIM):
+                return raw
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+        pass
+    # Fresh state
+    d = _BANDIT_DIM
+    return {
+        "arms": [
+            {"A_inv": _mat_identity(d), "b": [0.0] * d, "n": 0}
+            for _ in _BANDIT_ARMS
+        ],
+        "domain_stats": {},   # domain → {n, mean, M2}  (Welford)
+        "total_pulls": 0,
+    }
+
+def _save_ml_state(state: dict) -> None:
+    try:
+        _ML_STATE_PATH.write_text(json.dumps(state))
+    except OSError:
+        pass
+
+_ml_state_lock = threading.Lock()
+_ml_state: dict | None = None
+
+def _get_ml_state() -> dict:
+    global _ml_state
+    if _ml_state is None:
+        _ml_state = _load_ml_state()
+    return _ml_state
+
+
+# ── LinUCB select & update ────────────────────────────────────────────────────
+
+def _bandit_select(query: str) -> tuple[int, str]:
+    """Return (arm_index, expanded_query) using LinUCB."""
+    x = _query_to_context(query)
+    state = _get_ml_state()
+    arms = state["arms"]
+
+    best_arm, best_score = 0, -1e9
+    for i, arm_state in enumerate(arms):
+        A_inv = arm_state["A_inv"]
+        b = arm_state["b"]
+        theta = _mat_vec(A_inv, b)
+        exploit = _dot(theta, x)
+        Ax = _mat_vec(A_inv, x)
+        explore = _BANDIT_ALPHA * math.sqrt(max(_dot(x, Ax), 0.0))
+        score = exploit + explore
+        if score > best_score:
+            best_score, best_arm = score, i
+
+    template = _BANDIT_ARMS[best_arm]
+    expanded = template.replace("{q}", query)
+    return best_arm, expanded
+
+
+def _bandit_update(arm_index: int, query: str, reward: float) -> None:
+    """Update arm (arm_index) with observed reward ∈ [0,1]."""
+    x = _query_to_context(query)
+    with _ml_state_lock:
+        state = _get_ml_state()
+        arm = state["arms"][arm_index]
+        arm["A_inv"] = _sherman_morrison_update(arm["A_inv"], x)
+        arm["b"] = [arm["b"][j] + reward * x[j] for j in range(_BANDIT_DIM)]
+        arm["n"] += 1
+        state["total_pulls"] = state.get("total_pulls", 0) + 1
+        _save_ml_state(state)
+
+
+# ── Domain affinity — Welford online stats ────────────────────────────────────
+
+def _domain_of(url: str) -> str:
+    from urllib.parse import urlparse
+    host = urlparse(url).hostname or url
+    # strip www. and use registrable domain (last 2 parts)
+    parts = host.lstrip("www.").split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+def _update_domain_affinity(url: str, quality: float) -> None:
+    domain = _domain_of(url)
+    with _ml_state_lock:
+        state = _get_ml_state()
+        ds = state.setdefault("domain_stats", {})
+        if domain not in ds:
+            ds[domain] = {"n": 0, "mean": 0.0, "M2": 0.0}
+        s = ds[domain]
+        s["n"] += 1
+        delta = quality - s["mean"]
+        s["mean"] += delta / s["n"]
+        s["M2"] += delta * (quality - s["mean"])
+        _save_ml_state(state)
+
+def _domain_affinity_score(url: str) -> float:
+    """
+    Returns estimated quality for this domain ∈ [0,1], with UCB uncertainty bonus.
+    Falls back to 0.5 (neutral) when unseen.
+    """
+    domain = _domain_of(url)
+    state = _get_ml_state()
+    ds = state.get("domain_stats", {})
+    if domain not in ds or ds[domain]["n"] == 0:
+        return 0.5
+    s = ds[domain]
+    n = s["n"]
+    mean = s["mean"]
+    # UCB bonus: prefer less-observed domains slightly
+    ucb_bonus = math.sqrt(2 * math.log(max(state.get("total_pulls", 1), 1)) / n)
+    return min(mean + 0.1 * ucb_bonus, 1.0)
+
+
+# ── Reward computation from retrieval result ──────────────────────────────────
+
+def _compute_reward(source_results: list[dict]) -> float:
+    """
+    Composite reward ∈ [0,1] from parallel retrieval results.
+
+    r = 0.4 * confidence_score
+      + 0.4 * content_depth_score
+      + 0.2 * top_bm25_score (normalised)
+    """
+    if not source_results:
+        return 0.0
+
+    conf_map = {"high": 1.0, "medium": 0.6, "low": 0.3, "none": 0.0}
+    conf_scores = [conf_map.get(s.get("confidence", "none"), 0.0) for s in source_results]
+    conf = sum(conf_scores) / len(conf_scores)
+
+    # Depth: avg content length across all retrieved nodes, normalised at 400 chars
+    all_nodes = [n for s in source_results for n in s.get("nodes", [])]
+    if all_nodes:
+        avg_len = sum(len(n.get("content", "")) for n in all_nodes) / len(all_nodes)
+        depth = min(avg_len / 400.0, 1.0)
+    else:
+        depth = 0.0
+
+    # Top BM25 score normalised at 30.0 (typical high-quality match)
+    top_bm25 = max((n.get("_score", 0.0) for n in all_nodes), default=0.0)
+    bm25 = min(top_bm25 / 30.0, 1.0)
+
+    return 0.4 * conf + 0.4 * depth + 0.2 * bm25
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WEB SEARCH (DuckDuckGo HTML, no API key)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def search_web(query: str, max_results: int = 5) -> list[dict]:
+    """Search DuckDuckGo Lite (POST) and return [{url, title, snippet}] — no API key."""
+    from urllib.parse import urlencode, urlparse
+    try:
+        data = urlencode({'q': query, 'kl': 'us-en'}).encode()
+        req = Request('https://lite.duckduckgo.com/lite/', data=data, headers={
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Referer': 'https://lite.duckduckgo.com/',
+            'Origin': 'https://lite.duckduckgo.com',
+        })
+        response = urlopen(req, timeout=10, context=ssl_ctx)
+        html = response.read(300_000).decode('utf-8', errors='ignore')
+    except (HTTPError, URLError, OSError):
+        return []
+
+    results = []
+    # DDG Lite: links are plain https:// hrefs with visible title text
+    for m in re.finditer(r'<a[^>]+href="(https?://[^"]+)"[^>]*>([^<]+)</a>', html):
+        raw_url = _decode_entities(m.group(1))
+        title = _decode_entities(m.group(2)).strip()
+        if not title or len(title) < 5:
+            continue
+        parsed = urlparse(raw_url)
+        if 'duckduckgo.com' in parsed.netloc or 'duck.com' in parsed.netloc:
+            continue
+        results.append({"url": raw_url, "title": title, "snippet": ""})
+        if len(results) >= max_results:
+            break
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BM25 SCORING (replaces ad-hoc _score_node)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_NAV_HEADING_PATTERNS = re.compile(
+    r'^(overview|quickstart|get started|introduction|welcome|contents|'
+    r'table of contents|navigation|menu|sidebar|home|back|next|previous|'
+    r'on this page|in this section|see also|related|more|resources|'
+    r'documentation|docs|guide|tutorial|reference|api|changelog|'
+    r'community|support|contact|about|faq|search|login|sign in|sign up)$',
+    re.IGNORECASE,
+)
+
+# Primary-source URL patterns for citation chasing
+_PRIMARY_SOURCE_PATTERNS = re.compile(
+    r'(?:doi\.org/10\.|'
+    r'pubmed\.ncbi\.nlm\.nih\.gov/\d|'
+    r'ncbi\.nlm\.nih\.gov/pmc/articles/|'
+    r'nejm\.org/doi/|bmj\.com/content/|thelancet\.com/journals/|'
+    r'nature\.com/articles/|science\.org/doi/|cell\.com/[a-z-]+/fulltext/|'
+    r'pnas\.org/doi/|jamanetwork\.com/journals/|'
+    r'frontiersin\.org/articles/|journals\.plos\.org/plosone/article|'
+    r'nih\.gov/news-events/|who\.int/news-room/|cdc\.gov/[a-z].+/[a-z]|'
+    r'arxiv\.org/abs/\d|biorxiv\.org/content/|'
+    r'(?:harvard|stanford|mit|oxford|cambridge)\.edu/research/|'
+    r'(?:harvard|stanford|mit|oxford|cambridge)\.edu/[a-z].+/[a-z].+/)',
+    re.IGNORECASE,
+)
+
+
+def _extract_citation_urls(html: str, base_url: str) -> list[str]:
+    """Extract primary-source URLs (journals, DOI, NIH, .edu) from raw page HTML."""
+    from urllib.parse import urljoin, urlparse
+    base_host = urlparse(base_url).hostname or ''
+    found: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r'<a[^>]+href="([^"#][^"]*)"', html, re.IGNORECASE):
+        href = m.group(1).strip()
+        if not href:
+            continue
+        if href.startswith('http'):
+            url = href
+        elif href.startswith('//'):
+            url = 'https:' + href
+        else:
+            try:
+                url = urljoin(base_url, href)
+            except Exception:
+                continue
+        parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https'):
+            continue
+        if (parsed.hostname or '') == base_host:
+            continue
+        if _PRIMARY_SOURCE_PATTERNS.search(url) and url not in seen:
+            seen.add(url)
+            found.append(url)
+        if len(found) >= 8:
+            break
+    return found[:5]
+
+def _is_nav_node(node: dict) -> bool:
+    """True if this node is navigation/chrome, not substantive content."""
+    content = node.get("content", "")
+    heading = node.get("heading", "")
+    breadcrumb = node.get("breadcrumb", [])
+    ntype = node.get("type", "")
+
+    # Short heading-only nodes at depth ≤ 1 with no real content
+    if ntype == "heading" and len(content) < 60 and len(breadcrumb) <= 1:
+        return True
+
+    # Heading matches known nav labels exactly
+    if ntype == "heading" and _NAV_HEADING_PATTERNS.match(content.strip()):
+        return True
+
+    # List nodes that are pure link collections (short items, many of them)
+    if ntype == "list":
+        items = [l for l in content.split("\n") if l.strip().startswith("- ")]
+        if items and sum(len(i) for i in items) / max(len(items), 1) < 25:
+            return True
+
+    # Text nodes that are just a restatement of nav link text (very short)
+    if ntype == "text" and len(content) < 80 and len(breadcrumb) <= 1:
+        return True
+
+    return False
+
+
+def _build_idf(nodes: list[dict]) -> dict[str, float]:
+    """Compute IDF across substantive nodes only — nav nodes skew IDF badly."""
+    content_nodes = [n for n in nodes if not _is_nav_node(n)]
+    N = max(len(content_nodes), 1)
+    df: dict[str, int] = {}
+    for node in content_nodes:
+        field = f"{node.get('content','')} {node.get('heading','')} {' '.join(node.get('breadcrumb',[]))}"
+        seen_terms: set[str] = set()
+        for term in re.findall(r'\w{3,}', field.lower()):
+            if term not in seen_terms:
+                df[term] = df.get(term, 0) + 1
+                seen_terms.add(term)
+    idf: dict[str, float] = {}
+    for term, freq in df.items():
+        idf[term] = math.log((N - freq + 0.5) / (freq + 0.5) + 1)
+    return idf
+
+
+def _bm25_score(node: dict, query_terms: list[str], idf: dict[str, float],
+                avg_len: float, query_lower: str) -> float:
+    k1, b = 1.5, 0.75
+
+    # Field weights: content, heading (3×), breadcrumb (2×)
+    content = node.get("content", "").lower()
+    heading = node.get("heading", "").lower()
+    breadcrumb = " ".join(node.get("breadcrumb", [])).lower()
+
+    doc_len = len(content.split())
+    score = 0.0
+
+    for term in query_terms:
+        term_idf = idf.get(term, 0.0)
+        if term_idf <= 0:
+            continue
+
+        # Content BM25
+        tf_c = content.count(term)
+        if tf_c:
+            norm = tf_c * (k1 + 1) / (tf_c + k1 * (1 - b + b * doc_len / max(avg_len, 1)))
+            score += term_idf * norm
+
+        # Heading bonus (3×) — short field, no length norm
+        if term in heading:
+            score += term_idf * 3.0
+
+        # Breadcrumb bonus (2×)
+        if term in breadcrumb:
+            score += term_idf * 2.0
+
+    # Exact phrase match in any field
+    if query_lower in content or query_lower in heading:
+        score += 10.0
+
+    # Type bonus: code and parameters are high-signal
+    type_bonus = {"code": 3.0, "parameter": 3.0, "table": 2.0, "list": 1.5, "heading": 0.5}
+    score += type_bonus.get(node.get("type", ""), 0.0)
+
+    return score
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GRAPH RETRIEVAL — subtree-anchored (directional, not BFS scatter)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def retrieve(url: str, query: str, max_results: int = 5) -> list[dict]:
@@ -1043,138 +1507,108 @@ def retrieve(url: str, query: str, max_results: int = 5) -> list[dict]:
     if not nodes:
         return []
 
-    adj: dict[str, list[tuple[str, str, float]]] = {}
+    # Build adjacency: forward (parent→child) edges only for subtree collection
+    children: dict[str, list[tuple[str, str]]] = {}   # parent_id → [(child_id, etype)]
     for e in edges:
-        src, tgt, etype, w = e["source"], e["target"], e["type"], e.get("weight", 1.0)
-        adj.setdefault(src, []).append((tgt, etype, w))
-        adj.setdefault(tgt, []).append((src, etype, w))
+        etype = e["type"]
+        if etype in ("contains", "has_example", "has_parameter", "has_table", "has_list", "describes"):
+            children.setdefault(e["source"], []).append((e["target"], etype))
 
+    # BM25 setup
+    avg_len = sum(len(n.get("content", "").split()) for n in nodes) / max(len(nodes), 1)
+    idf = _build_idf(nodes)
     query_lower = query.lower()
-    query_terms = set(re.findall(r'\w{3,}', query_lower))
-    node_scores: dict[str, float] = {}
+    query_terms = re.findall(r'\w{3,}', query_lower)
 
+    node_map = {n["id"]: n for n in nodes}
+
+    # Score every substantive node — nav nodes excluded
+    node_scores: dict[str, float] = {}
     for node in nodes:
-        score = _score_node(node, query_terms, query_lower)
-        if score > 0:
-            node_scores[node["id"]] = score
+        if _is_nav_node(node):
+            continue
+        s = _bm25_score(node, query_terms, idf, avg_len, query_lower)
+        if s > 0:
+            node_scores[node["id"]] = s
 
     if not node_scores:
         for node in nodes:
-            keywords = set(node.get("keywords", []))
-            overlap = query_terms & keywords
-            if overlap:
-                node_scores[node["id"]] = len(overlap)
+            s = _bm25_score(node, query_terms, idf, avg_len, query_lower)
+            if s > 0:
+                node_scores[node["id"]] = s
 
     if not node_scores:
         return []
 
-    sorted_seeds = sorted(node_scores.items(), key=lambda x: -x[1])
-    seeds = [s[0] for s in sorted_seeds[:3]]
+    # Score every non-nav heading by aggregate (self + children)
+    heading_nodes = [n for n in nodes if n["type"] == "heading" and not _is_nav_node(n)]
+    anchor_scores: list[tuple[float, str]] = []
+    for hn in heading_nodes:
+        agg = node_scores.get(hn["id"], 0.0)
+        for child_id, _ in children.get(hn["id"], []):
+            agg += node_scores.get(child_id, 0.0) * 0.6
+        if agg > 0:
+            anchor_scores.append((agg, hn["id"]))
+    anchor_scores.sort(reverse=True)
 
-    visited = set()
-    cluster_scores: dict[str, float] = {}
+    # Take top-3 non-overlapping anchors so we cover multiple sections per page
+    seen_content: set[str] = set()
+    results: list[dict] = []
 
-    for seed_id in seeds:
-        seed_score = node_scores.get(seed_id, 0)
-        _bfs_collect(seed_id, adj, node_scores, cluster_scores, visited, seed_score, max_depth=2)
-
-    for nid, score in node_scores.items():
-        if nid not in cluster_scores:
-            cluster_scores[nid] = score * 0.5
-
-    ranked = sorted(cluster_scores.items(), key=lambda x: -x[1])
-
-    node_map = {n["id"]: n for n in nodes}
-    results = []
-    seen_content = set()
-
-    for nid, score in ranked:
-        if nid not in node_map:
-            continue
-        node = node_map[nid]
-
+    def _add(nid: str, score: float):
+        if len(results) >= max_results:
+            return
+        node = node_map.get(nid)
+        if not node:
+            return
         content = node.get("content", "")
         if not content or len(content) < 10:
-            continue
-
-        c_hash = _content_hash(content[:200])
-        if c_hash in seen_content:
-            continue
-        seen_content.add(c_hash)
-
+            return
+        ch = _content_hash(content[:200])
+        if ch in seen_content:
+            return
+        seen_content.add(ch)
         results.append({**node, "_score": score})
-        if len(results) >= max_results:
-            break
+
+    subtree_budget = max_results * 2  # nodes per anchor
+    used_subtrees: set[str] = set()
+    for _, anchor_id in anchor_scores[:3]:
+        subtree_ids: list[str] = []
+        _collect_subtree(anchor_id, children, subtree_ids, max_nodes=subtree_budget,
+                         _visited=set(used_subtrees))
+        for nid in subtree_ids:
+            used_subtrees.add(nid)
+            _add(nid, node_scores.get(nid, 0.0))
+
+    # Fill any remaining slots with highest-scored nodes not yet included
+    if len(results) < max_results:
+        for nid, score in sorted(node_scores.items(), key=lambda x: -x[1]):
+            if len(results) >= max_results:
+                break
+            _add(nid, score)
 
     return results
 
 
-def _score_node(node: dict, query_terms: set, query_lower: str) -> float:
-    score = 0.0
-    content_lower = node.get("content", "").lower()
-    heading_lower = node.get("heading", "").lower()
-    keywords = set(node.get("keywords", []))
-    breadcrumb_lower = " ".join(node.get("breadcrumb", [])).lower()
-
-    for term in query_terms:
-        tf = content_lower.count(term)
-        if tf > 0:
-            score += (tf * 2.5) / (tf + 1.5)
-
-        if term in heading_lower:
-            score += 4.0
-        if term in breadcrumb_lower:
-            score += 2.0
-
-    overlap = query_terms & keywords
-    score += len(overlap) * 2.0
-
-    if query_lower in content_lower:
-        score += 8.0
-
-    type_bonus = {
-        "code": 3.0, "parameter": 3.0, "table": 2.0,
-        "list": 1.0, "heading": 0.0, "text": -0.5,
-    }
-    score += type_bonus.get(node.get("type", ""), 0)
-
-    tokens = node.get("tokens", 0)
-    if tokens > 50:
-        score += 1.0
-    if tokens > 150:
-        score += 1.0
-
-    return score
-
-
-def _bfs_collect(
-    start_id: str, adj: dict, node_scores: dict,
-    cluster_scores: dict, visited: set, seed_score: float, max_depth: int = 2,
+def _collect_subtree(
+    node_id: str,
+    children: dict[str, list[tuple[str, str]]],
+    out: list[str],
+    max_nodes: int,
+    _visited: Optional[set] = None,
 ):
-    queue = [(start_id, 0, seed_score)]
-
-    while queue:
-        nid, depth, propagated_score = queue.pop(0)
-
-        if nid in visited or depth > max_depth:
-            continue
-        visited.add(nid)
-
-        own_score = node_scores.get(nid, 0)
-        final_score = own_score + propagated_score * (0.5 ** depth)
-        cluster_scores[nid] = max(cluster_scores.get(nid, 0), final_score)
-
-        for neighbor_id, edge_type, weight in adj.get(nid, []):
-            if neighbor_id not in visited:
-                edge_boost = {
-                    "has_example": 1.5, "has_parameter": 1.3,
-                    "contains": 1.0, "see_also": 0.8,
-                    "has_table": 0.7, "has_list": 0.6,
-                    "sibling": 0.4, "describes": 0.5,
-                }.get(edge_type, 0.5)
-
-                next_score = propagated_score * weight * edge_boost
-                queue.append((neighbor_id, depth + 1, next_score))
+    if _visited is None:
+        _visited = set()
+    if node_id in _visited or len(out) >= max_nodes:
+        return
+    _visited.add(node_id)
+    out.append(node_id)
+    # Depth-first in document order; prioritise high-signal edge types
+    priority = {"has_example": 0, "has_parameter": 1, "has_table": 2,
+                "has_list": 3, "describes": 4, "contains": 5}
+    kids = sorted(children.get(node_id, []), key=lambda x: priority.get(x[1], 9))
+    for child_id, _ in kids:
+        _collect_subtree(child_id, children, out, max_nodes, _visited)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1290,6 +1724,396 @@ def smart_lookup(url: str, query: str, max_results: int = 3, force_refresh: bool
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# MULTI-SOURCE SEARCH (search → parallel graph builds → merge)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _synthesize(query: str, fragments: str, sources: list[dict]) -> str:
+    """
+    One Haiku call over pre-filtered graph fragments → synthesized answer.
+
+    Haiku over 3k pre-filtered tokens costs ~$0.003 and produces synthesis
+    quality matching Sonnet over 50k raw tokens — because noise is already gone.
+    Falls back to raw fragments if the API key is missing or the call fails.
+    """
+    import os
+    import json as _json
+    from urllib.request import Request as _Req, urlopen as _urlopen
+    from urllib.error import URLError, HTTPError
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return fragments  # graceful fallback: no synthesis without key
+
+    source_list = "\n".join(f"- {s['title']} ({s['url']})" for s in sources[:8])
+    complexity = _query_complexity(query)
+    depth_instruction = ""
+    if complexity >= 2:
+        depth_instruction = (
+            "- This is a multi-dimensional question — cover EVERY aspect asked about in depth\n"
+            "- For comparisons: address each item across each dimension explicitly with specifics\n"
+            "- Prefer concrete data (numbers, benchmarks, versions) over vague summaries\n"
+            "- Be thorough — aim for a complete reference answer, not a brief summary\n"
+            "- Include implementation details, edge cases, and practical recommendations\n"
+        )
+    prompt = (
+        f"You are a research synthesizer. Using ONLY the source fragments below, "
+        f"answer the question precisely and completely.\n\n"
+        f"QUESTION: {query}\n\n"
+        f"SOURCES USED:\n{source_list}\n\n"
+        f"FRAGMENTS:\n{fragments}\n\n"
+        f"Write a structured answer that:\n"
+        f"- Covers all key mechanisms, findings, and evidence from the fragments\n"
+        f"- Includes specific numbers, study names, or effect sizes where present\n"
+        f"- Notes caveats and limitations explicitly\n"
+        f"- Cites which source each major claim comes from\n"
+        f"- Uses markdown headers and bullet points for clarity\n"
+        f"{depth_instruction}"
+        f"Do not add information not present in the fragments."
+    )
+
+    max_tokens = {1: 1500, 2: 3000, 3: 4000}[complexity]
+    payload = {
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    try:
+        req = _Req(
+            "https://api.anthropic.com/v1/messages",
+            data=_json.dumps(payload).encode(),
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            method="POST",
+        )
+        resp = _urlopen(req, timeout=30, context=ssl_ctx)
+        data = _json.loads(resp.read().decode())
+        return data["content"][0]["text"]
+    except (HTTPError, URLError, OSError, KeyError, IndexError):
+        return fragments  # fallback to raw fragments on any error
+
+
+def _query_complexity(query: str) -> int:
+    """
+    Estimate query complexity (1-3) from surface signals.
+    Multi-dimensional queries need more sources for completeness.
+    """
+    q = query.lower()
+    score = 1
+
+    # Comparison/vs queries need multiple perspectives
+    compare_signals = ["compare", " vs ", " versus ", "difference between", "pros and cons",
+                       "tradeoff", "trade-off", "advantages", "which is better"]
+    if any(s in q for s in compare_signals):
+        score += 1
+
+    # Multi-entity: counting distinct capitalized entities or comma-separated items
+    entities = re.findall(r'[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*', query)
+    if len(set(entities)) >= 3:
+        score += 1
+
+    # Long queries with multiple sub-questions (em dashes, commas, "and")
+    parts = re.split(r'[,—–]| and | \+ ', query)
+    if len(parts) >= 3:
+        score = max(score, 2)
+    if len(parts) >= 5:
+        score = 3
+
+    # Multi-hop causal chains ("from X through Y to Z", "causes → effects → response")
+    chain_signals = ["from .+ through .+ to", "causes .+ effects", "chain",
+                     "from .+ to .+ to"]
+    if any(re.search(s, q) for s in chain_signals):
+        score = max(score, 2)
+
+    # Technical depth markers
+    depth_signals = ["how does", "mechanism", "explain", "architecture", "implementation"]
+    if any(s in q for s in depth_signals) and len(query) > 80:
+        score = max(score, 2)
+
+    # Length alone signals multi-part question
+    if len(query) > 100:
+        score = max(score, 2)
+
+    return min(score, 3)
+
+
+def _decompose_aspects(query: str) -> list[str]:
+    """
+    Split a multi-dimensional query into sub-aspects for independent retrieval.
+    Returns the full query + distinct sub-queries. Zero cost — pure string logic.
+
+    Each sub-aspect must be a viable BM25 query: subject + aspect keywords.
+    For broad queries without clear delimiters, extracts noun-phrase clusters.
+    """
+    q_lower = query.lower()
+
+    # Extract the subject/topic from the query stem
+    subject_match = re.match(
+        r'(?:what (?:is|are)|how (?:does|do)|explain|compare|is)\s+(.+?)(?:\s*[—–?]|$)',
+        q_lower
+    )
+    subject = subject_match.group(1).strip() if subject_match else ""
+    # Trim subject: keep up to first delimiter or "and which/and how/and what"
+    subject = re.split(r'\band (?:which|how|what|who|where)\b', subject)[0].strip()
+    subject_words = subject.split()
+    if len(subject_words) > 8:
+        subject = " ".join(subject_words[:8])
+
+    # Split on delimiters that separate aspects
+    parts = re.split(r'[,—–]', query)
+    parts = [p.strip() for p in parts if len(p.strip()) > 8]
+
+    aspects = [query]  # full query is always primary
+
+    if len(parts) > 1:
+        for part in parts[1:]:
+            part_clean = part.strip().rstrip('?')
+            if len(part_clean.split()) < 2:
+                continue
+            # Ensure each aspect has enough context to be a good BM25 query
+            if subject and len(part_clean.split()) < 4:
+                aspect = f"{subject} {part_clean}"
+            elif subject:
+                aspect = f"{subject} {part_clean}"
+            else:
+                aspect = part_clean
+            aspects.append(aspect)
+    elif len(query) > 80:
+        # Broad query without delimiters — extract "and which/and how/and what" sub-questions
+        sub_qs = re.split(r'\band (?:which|how|what|who|where|when)\b', query, flags=re.IGNORECASE)
+        if len(sub_qs) >= 2 and subject:
+            for part in sub_qs[1:]:
+                part_clean = part.strip().rstrip('?')
+                if len(part_clean.split()) >= 3:
+                    aspects.append(f"{subject} {part_clean}")
+
+    return aspects[:5]
+
+
+def web_find(query: str, num_sources: int = 0, max_results_per_source: int = 0,
+             synthesize: bool = True) -> dict:
+    """
+    Search the web for a query, fetch top sources in parallel, merge best nodes.
+
+    Unlike DeepSearch (100 agents × full pages), this:
+    - Fetches only structurally relevant subtrees (no full-page reads)
+    - Drops low-confidence sources before reading them
+    - Returns complete relevant content — never truncates for token savings
+    - Adaptively scales sources based on query complexity
+
+    Returns:
+        status: "success" | "partial" | "no_results"
+        content: Merged ranked nodes with source attribution
+        sources: [{url, title, confidence}]
+        tokens_used: Total tokens across all sources
+        search_results: Raw DDG results for transparency
+    """
+    # Adaptive: scale sources to query complexity if not explicitly set
+    complexity = _query_complexity(query)
+    if num_sources <= 0:
+        num_sources = {1: 3, 2: 5, 3: 6}[complexity]
+    if max_results_per_source <= 0:
+        max_results_per_source = {1: 5, 2: 7, 3: 9}[complexity]
+
+    # No hard cap — the model can request as many sources as it needs.
+    # Practical limit is DDG result count per search (~20-30 max).
+    # For broader coverage, the model should call web_find multiple times
+    # with different sub-queries (like deep-research spawns sub-agents).
+
+    # LinUCB: choose search strategy based on query context
+    arm_index, expanded_query = _bandit_select(query)
+
+    search_hits = search_web(expanded_query, max_results=num_sources * 2)
+    if not search_hits:
+        # Fallback: retry with base query if expanded got nothing
+        search_hits = search_web(query, max_results=num_sources * 2)
+    if not search_hits:
+        return {
+            "status": "no_results",
+            "content": f"No search results for '{query}'",
+            "sources": [], "tokens_used": 0, "search_results": [],
+        }
+
+    # Re-rank DDG results using learned domain affinity scores
+    for h in search_hits:
+        h["_affinity"] = _domain_affinity_score(h["url"])
+    search_hits.sort(key=lambda h: -h["_affinity"])
+
+    candidate_urls = [h["url"] for h in search_hits[:num_sources * 2]]
+
+    # Parallel graph builds — one thread per URL, timeout-guarded
+    results_lock = threading.Lock()
+    source_results: list[dict] = []
+
+    citation_urls_lock = threading.Lock()
+    citation_urls_found: list[tuple[str, str]] = []  # [(url, parent_title)]
+
+    # Decompose query into aspects for broader retrieval coverage
+    aspects = _decompose_aspects(query) if complexity >= 2 else [query]
+
+    def _fetch_source(url: str, title: str, collect_citations: bool = False):
+        try:
+            graph = build_graph(url)
+            conf = graph.get("confidence", {})
+            if conf.get("level") == "none":
+                return
+
+            # Multi-aspect retrieval: retrieve for each aspect, merge unique nodes
+            seen_ids: set[str] = set()
+            all_nodes: list[dict] = []
+            per_aspect = max(3, max_results_per_source // len(aspects))
+
+            for aspect in aspects:
+                nodes = retrieve(url, aspect, max_results=per_aspect)
+                for n in nodes:
+                    if n["id"] not in seen_ids:
+                        seen_ids.add(n["id"])
+                        all_nodes.append(n)
+
+            if not all_nodes:
+                return
+            with results_lock:
+                source_results.append({
+                    "url": url, "title": title,
+                    "confidence": conf.get("level", "low"),
+                    "nodes": all_nodes[:max_results_per_source * 2],
+                })
+            if collect_citations:
+                cites = graph.get("citation_urls", [])
+                with citation_urls_lock:
+                    for cu in cites[:2]:
+                        citation_urls_found.append((cu, title))
+        except Exception:
+            pass
+
+    threads = []
+    url_to_title = {h["url"]: h["title"] for h in search_hits}
+    for url in candidate_urls[:num_sources * 2]:
+        t = threading.Thread(
+            target=_fetch_source,
+            args=(url, url_to_title.get(url, url), True),  # collect citations
+            daemon=True,
+        )
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join(timeout=25)
+
+    # Wave 2: chase up to 4 primary-source citations found in summary pages
+    already_fetched = set(candidate_urls[:num_sources * 2])
+    cite_threads = []
+    for cite_url, parent_title in citation_urls_found[:4]:
+        if cite_url in already_fetched:
+            continue
+        already_fetched.add(cite_url)
+        cite_title = f"[primary source via {parent_title[:30]}]"
+        t = threading.Thread(
+            target=_fetch_source,
+            args=(cite_url, cite_title, False),
+            daemon=True,
+        )
+        t.start()
+        cite_threads.append(t)
+    for t in cite_threads:
+        t.join(timeout=20)
+
+    if not source_results:
+        return {
+            "status": "no_results",
+            "content": f"Sources found but none had extractable content for '{query}'",
+            "sources": [], "tokens_used": 0,
+            "search_results": [{"url": h["url"], "title": h["title"]} for h in search_hits],
+        }
+
+    # Compute reward and update bandit + domain affinity models
+    reward = _compute_reward(source_results)
+    _bandit_update(arm_index, query, reward)
+    for src in source_results:
+        conf_map = {"high": 1.0, "medium": 0.6, "low": 0.3, "none": 0.0}
+        src_quality = conf_map.get(src.get("confidence", "none"), 0.0)
+        _update_domain_affinity(src["url"], src_quality)
+
+    # Rank sources: high-confidence first, then by top node score
+    source_results.sort(key=lambda s: (
+        {"high": 0, "medium": 1, "low": 2}.get(s["confidence"], 3),
+        -max((n.get("_score", 0) for n in s["nodes"]), default=0)
+    ))
+
+    # Merge: include all relevant nodes, dedup identical content across sources
+    seen_content: set[str] = set()
+    merged_nodes: list[dict] = []
+    tokens_used = 0
+    sources_used: list[dict] = []
+
+    for src in source_results:
+        src_tokens = 0
+        src_added = False
+        for node in src["nodes"]:
+            content = node.get("content", "")
+            ch = _content_hash(content[:200])
+            if ch in seen_content:
+                continue
+            seen_content.add(ch)
+            merged_nodes.append({**node, "_source_url": src["url"], "_source_title": src["title"]})
+            node_tokens = _estimate_tokens(content)
+            tokens_used += node_tokens
+            src_tokens += node_tokens
+            src_added = True
+        if src_added:
+            sources_used.append({
+                "url": src["url"], "title": src["title"],
+                "confidence": src["confidence"], "tokens": src_tokens,
+            })
+
+    if not merged_nodes:
+        return {
+            "status": "no_results",
+            "content": "No relevant content extracted from sources",
+            "sources": [], "tokens_used": 0,
+            "search_results": [{"url": h["url"], "title": h["title"]} for h in search_hits],
+        }
+
+    # Format raw fragments — source-attributed
+    parts = []
+    for node in merged_nodes:
+        breadcrumb = " > ".join(node.get("breadcrumb", []))
+        src_title = node.get("_source_title", node.get("_source_url", ""))
+        node_type = node["type"]
+        parts.append(f"[{node_type}] {src_title} | {breadcrumb}\n{node.get('content', '')}")
+
+    raw_content = "\n\n---\n\n".join(parts)
+    status = "success" if len(sources_used) >= 1 else "partial"
+
+    if not synthesize:
+        return {
+            "status": status,
+            "content": raw_content,
+            "sources": sources_used,
+            "tokens_used": tokens_used,
+            "search_results": [{"url": h["url"], "title": h["title"]} for h in search_hits],
+            "_ml": {"arm": arm_index, "strategy": _BANDIT_ARMS[arm_index], "reward": round(reward, 3)},
+        }
+
+    # Synthesis: one Haiku call over pre-filtered fragments → structured answer
+    synthesized = _synthesize(query, raw_content, sources_used)
+    synth_tokens = _estimate_tokens(synthesized)
+
+    return {
+        "status": status,
+        "content": synthesized,
+        "raw_fragments": raw_content,
+        "sources": sources_used,
+        "tokens_used": synth_tokens,
+        "fragment_tokens": tokens_used,
+        "search_results": [{"url": h["url"], "title": h["title"]} for h in search_hits],
+        "_ml": {"arm": arm_index, "strategy": _BANDIT_ARMS[arm_index], "reward": round(reward, 3)},
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1325,6 +2149,24 @@ if __name__ == "__main__":
         url = sys.argv[2]
         graph = build_graph(url)
         print(json.dumps(graph["stats"], indent=2))
+
+    elif cmd == "find":
+        query = ' '.join(sys.argv[2:])
+        result = web_find(query)
+        print(f"Status: {result['status']}  |  {result['tokens_used']} tokens")
+        print(f"Sources: {len(result['sources'])}")
+        for s in result['sources']:
+            print(f"  [{s['confidence']}] {s['title']} ({s['tokens']} tok) — {s['url']}")
+        print()
+        print(result['content'])
+
+    elif cmd == "search":
+        query = ' '.join(sys.argv[2:])
+        hits = search_web(query)
+        for h in hits:
+            print(f"{h['url']}")
+            if h.get('snippet'):
+                print(f"  {h['snippet'][:80]}")
 
     else:
         print(f"Unknown command: {cmd}")
