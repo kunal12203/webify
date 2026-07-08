@@ -4,6 +4,8 @@ Adaptive web research for AI coding agents. Search the web, build semantic graph
 
 A skill by [GrapeRoot](https://graperoot.dev)
 
+**Docs:** [中文](docs/README.zh-CN.md) | [日本語](docs/README.ja.md) | [한국어](docs/README.ko.md) | [Español](docs/README.es.md) | [हिन्दी](docs/README.hi.md) | [Français](docs/README.fr.md) | [Deutsch](docs/README.de.md) | [Português](docs/README.pt-BR.md) | [Русский](docs/README.ru.md)
+
 ## What it does
 
 | Tool | Purpose | Cost |
