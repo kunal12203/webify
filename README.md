@@ -2,6 +2,8 @@
 
 Adaptive web research for AI coding agents. Search the web, build semantic graphs, get synthesized answers — at 5% the cost of deep research tools.
 
+A skill by [GrapeRoot](https://graperoot.dev)
+
 ## What it does
 
 | Tool | Purpose | Cost |
