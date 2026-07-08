@@ -73,46 +73,20 @@ Query → BM25 score nodes → BFS traversal → ~250-750 tokens
 
 ## Installation
 
-### Quick Install (Recommended)
-
-**macOS / Linux:**
 ```bash
-curl -fsSL https://graperoot.dev/webify/install.sh | bash
+git clone https://github.com/kunal12203/webify.git ~/.webify
+pip install "mcp>=1.3.0"
+claude mcp add webify -- python3 ~/.webify/mcp_server.py
 ```
 
-**Windows (PowerShell):**
-```powershell
-irm https://graperoot.dev/webify/install.ps1 | iex
-```
-
-The installer will:
-- Download Webify to `~/.webify/`
-- Install Python dependencies (`mcp>=1.3.0`)
-- Auto-configure detected MCP tools (Claude Code, VS Code, Cursor, Windsurf, Zed)
-- Set up cache directory at `~/.cache/webify`
+That's it. Works with any MCP client — see [Tool-Specific Setup](#tool-specific-setup) for VS Code, Cursor, Windsurf, Zed.
 
 **Requirements:** Python 3.9+, pip, git
 
-### Manual Installation
-
-```bash
-git clone https://github.com/kunal12203/webify.git
-cd webify
-pip install "mcp>=1.3.0"
-```
-
-Then configure your MCP client (see [Tool-Specific Setup](#tool-specific-setup) below).
-
 ## Updating
 
-**Auto-install users:**
 ```bash
-curl -fsSL https://graperoot.dev/webify/install.sh | bash
-```
-
-**Manual install users:**
-```bash
-cd /path/to/webify
+cd ~/.webify
 git pull origin master
 ```
 
@@ -120,11 +94,7 @@ git pull origin master
 
 ### Claude Code
 
-```bash
-claude mcp add webify -- python3 ~/.webify/mcp_server.py
-```
-
-Verify:
+Already configured during installation. Verify:
 ```bash
 claude mcp list  # Should show "webify"
 ```
