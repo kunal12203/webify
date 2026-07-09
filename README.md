@@ -50,7 +50,7 @@ Adapts depth to query complexity. Simple questions hit 3 sources. Multi-dimensio
 ### web_lookup — single-page retrieval
 
 ```
-URL → Fetch → Semantic graph → BFS traversal → ~250–750 tokens
+URL → Fetch → DOM structural graph → BFS traversal → ~250–750 tokens
 ```
 
 Scores nodes against your query, returns only the relevant subtree — 80–300 tokens instead of the 3,000–15,000 tokens of full page text WebFetch puts in context.

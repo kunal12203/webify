@@ -2,7 +2,7 @@
 
 [English](../README.md) | [Deutsch](README.de.md)
 
-Adaptive Webrecherche fuer KI-Coding-Agenten. Durchsuchen Sie das Web, erstellen Sie semantische Graphen, erhalten Sie synthetisierte Antworten -- bei 5 % der Kosten herkoemmlicher Deep-Research-Tools.
+Adaptive Webrecherche fuer KI-Coding-Agenten. Durchsuchen Sie das Web, erstellen Sie strukturelle DOM-Graphen, erhalten Sie synthetisierte Antworten -- bei 5 % der Kosten herkoemmlicher Deep-Research-Tools.
 
 Ein Skill von [GrapeRoot](https://graperoot.dev)
 
@@ -13,7 +13,7 @@ Ein Skill von [GrapeRoot](https://graperoot.dev)
 | `web_find(query)` | Multi-Source-Websuche + Synthese | ~$0.003/Abfrage |
 | `web_lookup(url, query)` | Einzelseiten-Graph-Abruf | ~$0.0005/Abfrage |
 
-**web_find** durchsucht DuckDuckGo, erstellt parallele semantische Graphen aus mehreren Quellen, extrahiert relevante Inhalte via BM25 und synthetisiert mit Haiku. Die Suchtiefe passt sich der Komplexitaet der Anfrage an -- einfache Faktenabfragen nutzen 3 Quellen, mehrdimensionale Rechercheabfragen skalieren auf 6+ Quellen mit Multi-Aspekt-Retrieval.
+**web_find** durchsucht DuckDuckGo, erstellt parallele strukturelle DOM-Graphen aus mehreren Quellen, extrahiert relevante Inhalte via BM25 und synthetisiert mit Haiku. Die Suchtiefe passt sich der Komplexitaet der Anfrage an -- einfache Faktenabfragen nutzen 3 Quellen, mehrdimensionale Rechercheabfragen skalieren auf 6+ Quellen mit Multi-Aspekt-Retrieval.
 
 **web_lookup** ruft eine einzelne Seite ab, bewertet Knoten anhand deiner Anfrage und gibt nur den relevanten Teilbaum zurück — 80–300 Tokens statt 3.000–15.000 Tokens Volltext, die WebFetch in den Kontext lädt.
 

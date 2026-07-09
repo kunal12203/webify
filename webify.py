@@ -1,7 +1,7 @@
 """
-Webify v1.0: Semantic Web Graph for Claude Code
+Webify v1.0: DOM Structural Graph for Claude Code
 
-Builds a semantic graph from any web page, then retrieves only the relevant
+Builds a structural graph from any web page, then retrieves only the relevant
 nodes via BFS traversal. Returns ~250-750 tokens instead of 5000-50000.
 
 Architecture:

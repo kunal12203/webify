@@ -2,7 +2,7 @@
 
 [English](../README.md) | [Español](README.es.md)
 
-Investigacion web adaptativa para agentes de programacion con IA. Busca en la web, construye grafos semanticos, obtiene respuestas sintetizadas — al 5% del costo de las herramientas de investigacion profunda.
+Investigacion web adaptativa para agentes de programacion con IA. Busca en la web, construye grafos estructurales DOM, obtiene respuestas sintetizadas — al 5% del costo de las herramientas de investigacion profunda.
 
 Un skill de [GrapeRoot](https://graperoot.dev)
 
@@ -13,7 +13,7 @@ Un skill de [GrapeRoot](https://graperoot.dev)
 | `web_find(query)` | Busqueda web multi-fuente + sintesis | ~$0.003/consulta |
 | `web_lookup(url, query)` | Recuperacion de grafo de pagina unica | ~$0.0005/consulta |
 
-**web_find** busca en DuckDuckGo, construye grafos semanticos a partir de multiples fuentes en paralelo, extrae contenido relevante mediante BM25 y sintetiza con Haiku. Adapta la profundidad segun la complejidad de la consulta — las consultas factuales simples acceden a 3 fuentes, mientras que las consultas de investigacion multidimensional escalan a 6+ fuentes con recuperacion multi-aspecto.
+**web_find** busca en DuckDuckGo, construye grafos estructurales DOM a partir de múltiples fuentes en paralelo, extrae contenido relevante mediante BM25 y sintetiza con Haiku. Adapta la profundidad segun la complejidad de la consulta — las consultas factuales simples acceden a 3 fuentes, mientras que las consultas de investigacion multidimensional escalan a 6+ fuentes con recuperacion multi-aspecto.
 
 **web_lookup** obtiene una sola página, puntúa los nodos según tu consulta y devuelve únicamente el subárbol relevante — 80–300 tokens en lugar de los 3,000–15,000 tokens de texto completo que WebFetch pone en contexto.
 

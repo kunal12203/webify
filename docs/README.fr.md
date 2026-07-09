@@ -2,7 +2,7 @@
 
 [English](../README.md) | [Français](README.fr.md)
 
-Recherche web adaptative pour les agents de codage IA. Recherchez sur le web, construisez des graphes semantiques, obtenez des reponses synthetisees -- a 5 % du cout des outils de recherche approfondie.
+Recherche web adaptative pour les agents de codage IA. Recherchez sur le web, construisez des graphes structurels DOM, obtenez des réponses synthétisées -- a 5 % du cout des outils de recherche approfondie.
 
 Un skill par [GrapeRoot](https://graperoot.dev)
 
@@ -13,7 +13,7 @@ Un skill par [GrapeRoot](https://graperoot.dev)
 | `web_find(query)` | Recherche web multi-sources + synthese | ~$0.003/requete |
 | `web_lookup(url, query)` | Extraction par graphe d'une page unique | ~$0.0005/requete |
 
-**web_find** effectue une recherche sur DuckDuckGo, construit des graphes semantiques a partir de plusieurs sources en parallele, extrait le contenu pertinent via BM25, et synthetise avec Haiku. Il adapte la profondeur en fonction de la complexite de la requete -- les requetes factuelles simples interrogent 3 sources, tandis que les requetes de recherche multidimensionnelles montent a 6+ sources avec une extraction multi-aspect.
+**web_find** effectue une recherche sur DuckDuckGo, construit des graphes structurels DOM à partir de plusieurs sources en parallèle, extrait le contenu pertinent via BM25, et synthetise avec Haiku. Il adapte la profondeur en fonction de la complexite de la requete -- les requetes factuelles simples interrogent 3 sources, tandis que les requetes de recherche multidimensionnelles montent a 6+ sources avec une extraction multi-aspect.
 
 **web_lookup** récupère une seule page, évalue les nœuds selon votre requête et renvoie uniquement le sous-arbre pertinent — 80–300 tokens au lieu des 3 000–15 000 tokens de texte complet que WebFetch charge en contexte.
 

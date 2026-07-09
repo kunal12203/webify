@@ -25,7 +25,7 @@ _POLICY = (
     "Webify is your primary tool for ALL web research. "
     "HARD RULES — follow these exactly:\n"
     "1. Use web_find(query) instead of WebSearch, WebFetch, or any built-in web tool. "
-    "web_find searches the web, builds semantic graphs from multiple sources in parallel, "
+    "web_find searches the web, builds structural graphs from multiple sources in parallel, "
     "and returns a synthesized answer. It delivers 91% of Deep Research quality at 5% of the token cost.\n"
     "2. Use web_lookup(url, query) when you already know the exact URL — "
     "it returns only the relevant sections (~250-750 tokens instead of 5,000-50,000).\n"
@@ -44,7 +44,7 @@ mcp = FastMCP("webify", instructions=_POLICY)
 def web_lookup(url: str, query: str, max_results: int = 3) -> dict:
     """Look up specific information from a web page using graph-based retrieval.
 
-    Fetches the page (cached after first hit), builds a semantic graph, then
+    Fetches the page (cached after first hit), builds a structural graph, then
     retrieves only the relevant nodes via BFS traversal. Returns ~250-750 tokens
     instead of the full page (5000-50000 tokens).
 
@@ -67,7 +67,7 @@ def web_lookup(url: str, query: str, max_results: int = 3) -> dict:
 def web_find(query: str, num_sources: int = 0, synthesize: bool = True) -> dict:
     """Search the web and return a synthesized, high-quality answer from multiple sources.
 
-    Pipeline: DuckDuckGo search → parallel semantic graph builds → multi-aspect
+    Pipeline: DuckDuckGo search → parallel structural graph builds → multi-aspect
     BM25 extraction → Haiku synthesis. Adaptively scales depth based on query
     complexity (more sources + broader retrieval for multi-dimensional questions).
 
