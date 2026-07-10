@@ -31,7 +31,23 @@ That's it. Works in Claude Code, Cursor, VS Code, Windsurf, and Zed.
 
 ## What it does
 
-Webify gives your AI two tools for web research — both dramatically cheaper than reading full pages:
+```mermaid
+flowchart TB
+    Agent[AI Agent] -->|"web_find('query')"| Webify
+    Agent -->|"web_lookup(url, 'query')"| Webify
+    Webify -->|"80–300 tokens"| Agent
+    
+    subgraph Webify[Webify MCP Server]
+        Search[Search\nBrave / DDG] --> Graph[DOM Structural\nGraph Builder]
+        Graph --> Retrieve[BM25 + BFS\nRetrieval]
+        Retrieve --> Synthesize[Haiku\nSynthesis]
+    end
+
+    style Webify fill:#1a1a2e,stroke:#16213e,color:#fff
+    style Agent fill:#0f3460,stroke:#16213e,color:#fff
+```
+
+Two tools for web research — both dramatically cheaper than reading full pages:
 
 | Tool | When to use | Cost |
 |------|------------|------|
@@ -40,17 +56,31 @@ Webify gives your AI two tools for web research — both dramatically cheaper th
 
 ### web_find — multi-source research
 
-```
-Query → Search (Brave/DDG) → Parallel graph builds (3–6 sources)
-     → BM25 multi-aspect extraction → Haiku synthesis → Answer
+```mermaid
+flowchart LR
+    A[Query] --> B[Search\nBrave / DDG]
+    B --> C1[Page 1]
+    B --> C2[Page 2]
+    B --> C3[Page 3–6]
+    C1 --> D[DOM Graph\n+ BM25]
+    C2 --> D
+    C3 --> D
+    D --> E[Multi-aspect\nextraction]
+    E --> F[Haiku\nsynthesis]
+    F --> G["Answer\n(~800 tokens)"]
 ```
 
 Adapts depth to query complexity. Simple questions hit 3 sources. Multi-dimensional research scales to 6+ with independent sub-aspect retrieval. Call it multiple times with focused sub-queries for deep-research-level coverage.
 
 ### web_lookup — single-page retrieval
 
-```
-URL → Fetch → DOM structural graph → BFS traversal → ~250–750 tokens
+```mermaid
+flowchart LR
+    A[URL + Query] --> B[Fetch page]
+    B --> C[DOM structural\ngraph]
+    C --> D[BM25 scoring]
+    D --> E[BFS traversal]
+    E --> F["Relevant subtree\n(80–300 tokens)"]
 ```
 
 Scores nodes against your query, returns only the relevant subtree — 80–300 tokens instead of the 3,000–15,000 tokens of full page text WebFetch puts in context.
