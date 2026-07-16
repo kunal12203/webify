@@ -17,15 +17,18 @@ Zero external dependencies — stdlib only.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import math
 import os
 import re
+import socket
 import time
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 import ssl
@@ -34,8 +37,15 @@ CACHE_DIR = Path(os.environ.get("WEBIFY_CACHE_DIR", Path.home() / ".cache" / "we
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 ssl_ctx = ssl.create_default_context()
-ssl_ctx.check_hostname = False
-ssl_ctx.verify_mode = ssl.CERT_NONE
+try:
+    # Optional: supplements (never replaces) system verification. Some Python
+    # installs (notably python.org builds on macOS) ship without a populated
+    # root CA path, which makes every HTTPS fetch fail cert verification.
+    # certifi is not a hard dependency — this is a no-op if it isn't installed.
+    import certifi
+    ssl_ctx.load_verify_locations(certifi.where())
+except ImportError:
+    pass
 
 MAX_PAGE_BYTES = 3_000_000
 TARGET_CHUNK_TOKENS = 250
@@ -101,7 +111,34 @@ def _extract_keywords(text: str, extra: str = "") -> list[str]:
 # FETCHING
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _is_safe_url(url: str) -> bool:
+    """Reject URLs whose host resolves to a private/loopback/link-local/reserved
+    address, so agent-driven fetches can't be steered at internal services or
+    cloud metadata endpoints (SSRF)."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or
+                ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+            return False
+    return True
+
+
 def fetch_page(url: str) -> tuple[str, str]:
+    if not _is_safe_url(url):
+        raise URLError(f"blocked: '{url}' resolves to a non-public address")
     req = Request(url, headers={
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
